@@ -1,0 +1,150 @@
+import discord
+from discord.ext import commands
+import json
+import requests
+import random
+import asyncio
+import datetime
+import urllib
+
+intents = discord.Intents.all()
+bot = commands.Bot(command_prefix='/', intents=intents)
+
+
+@bot.event
+async def on_ready():
+    print('Bot is ready.')
+
+
+@bot.command(name="server")
+async def server(ctx: commands.Context, server_name: str) -> None:
+    """Responds with the server address for a given server."""
+    if server_name.lower() == "hypixel":
+        await ctx.send("The server address for Hypixel is `mc.hypixel.net`.")
+    elif server_name.lower() == "herobrine":
+        await ctx.send("The server address for Herobrine is `herobrine.org`.")
+    else:
+        await ctx.send("Sorry, I don't have the server address for that server.")
+
+
+@bot.command(name="spin")
+async def spin(ctx: commands.Context) -> None:
+    """Sends a random GIF in an embed."""
+    url = ["https://i.kym-cdn.com/photos/images/newsfeed/001/879/084/63d.gif"]
+    embed = discord.Embed()
+    embed.set_image(url=url)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="purge")
+@commands.has_permissions(manage_messages=True)
+async def purge_command(ctx, amount: int) -> None:
+    """Deletes a specified amount of messages from the current channel."""
+    await ctx.message.delete()  # Delete the user's command message
+
+    if amount < 1:
+        await ctx.send("Please provide a positive number of messages to delete.")
+        return
+
+    deleted = await ctx.channel.purge(limit=amount)
+    await ctx.send(f"Deleted {len(deleted)} messages.")
+
+
+@bot.command()
+async def meme(ctx, category: str = 'memes'):
+    categories = ['memes', 'dankmemes', 'wholesomememes', 'me_irl', '2meirl4meirl', 'surrealmemes', 'terriblefacebookmemes', 'meirl', 'AdviceAnimals', 'crappydesign', 'forbiddensnacks', 'woooosh', 'insaneparents', 'facepalm', 'technicallythetruth', 'iamverysmart', 'holdmybeer', 'showerthoughts', 'blackpeopletwitter', 'whitepeopletwitter', 'interestingasfuck', 'funny', 'pics', 'aww', 'gifs', 'videos', 'science', 'food', 'news', 'movies', 'gay']
+    if category not in categories:
+        await ctx.send("Invalid category. Please choose one of the following categories: " + ", ".join(categories))
+        return
+    
+    response = requests.get(f'https://www.reddit.com/r/{category}/random/.json', headers={'User-agent': 'Mozilla/5.0'})
+    json_data = response.json()
+    post = json_data[0]['data']['children'][0]['data']
+    
+    permalink = post['permalink']
+    meme_url = f"https://reddit.com{permalink}"
+    meme_image = post['url']
+    meme_title = post['title']
+    meme_upvotes = post['ups']
+    meme_num_comments = post['num_comments']
+    
+    embed = discord.Embed(title=meme_title, url=meme_url, color=discord.Color.random())
+    embed.set_image(url=meme_image)
+    embed.set_footer(text=f"👍 {meme_upvotes} 💬 {meme_num_comments}")
+    
+    await ctx.send(embed=embed)
+
+   
+@bot.command(name="cat")
+async def cat(ctx: commands.Context) -> None:
+    response = requests.get('https://api.thecatapi.com/v1/images/search')
+    url = response.json()[0]["url"]
+    embed = discord.Embed()
+    embed.set_image(url=url)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="dog")
+async def dog(ctx: commands.Context) -> None:
+    response = requests.get('https://dog.ceo/api/breeds/image/random')
+    url = response.json()["message"]
+    embed = discord.Embed()
+    embed.set_image(url=url)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="joke")
+async def joke(ctx: commands.Context) -> None:
+    response = requests.get('https://official-joke-api.appspot.com/random_joke')
+    joke = response.json()
+    await ctx.send(f"{joke['setup']} {joke['punchline']}")
+
+
+@bot.command(name="quote")
+async def quote(ctx: commands.Context) -> None:
+    response = requests.get('https://zenquotes.io/api/random')
+    quote = response.json()[0]
+    await ctx.send(f"{quote['q']} - {quote['a']}")
+
+
+@bot.command(name='fact')
+async def get_fact(ctx, category: str = 'random'):
+    # Set up the API URL based on the category parameter
+    if category == 'random':
+        url = 'https://uselessfacts.jsph.pl/random.json?language=en'
+    elif category == 'cat':
+        url = 'https://uselessfacts.jsph.pl/cat.json?language=en'
+    elif category == 'dog':
+        url = 'https://uselessfacts.jsph.pl/dog.json?language=en'
+    elif category == 'minecraft':
+        url = 'https://uselessfacts.jsph.pl/minecraft.json?language=en'
+    elif category == 'roblox':
+        url = 'https://uselessfacts.jsph.pl/roblox.json?language=en'
+    else:
+        await ctx.send('Sorry, that category is not supported.')
+        return
+    
+    # Call the API and get a random fact
+    response = requests.get(url)
+    if response.status_code != 200:
+        await ctx.send('Sorry, something went wrong. Please try again later.')
+        return
+    data = response.json()
+    fact = data['text']
+    
+    # Send the fact as a message
+    message = f'Here is a {category} fact: {fact}'
+    await ctx.send(message)
+
+
+
+@bot.command(name="news")
+async def news(ctx: commands.Context, *, source: str) -> None:
+    url = f"https://newsapi.org/v2/top-headlines?sources={source}&apiKey=YOUR_API_KEY_HERE"
+    response = requests.get(url)
+    articles = response.json()["articles"]
+    for article in articles:
+        await ctx.send(f"{article['title']} - {article['url']}")
+
+
+bot.run('MTA4NTczNjc4ODkyNjE0ODY5OQ.Gs1xg7.JWonLEF_4r7PazznA68QiDhYy_aQmY4-M9_6qc')
