@@ -1,150 +1,1416 @@
 import discord
-from discord.ext import commands
-import json
-import requests
-import random
+import youtube_dl
+import yt_dlp
 import asyncio
-import datetime
-import urllib
+import os
+import datetime # Added for moderation command footers
+import random # For FunCommands
+from discord.ext import commands
+from discord.ext import tasks
 
-intents = discord.Intents.all()
-bot = commands.Bot(command_prefix='/', intents=intents)
+from dotenv import load_dotenv
 
+load_dotenv()
+
+
+youtube_dl.utils.bug_reports_message = lambda: ''
+
+ytdl_format_options = {
+    'format': 'bestaudio/best',
+    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
+    'restrictfilenames': True,
+    'noplaylist': True,
+    'nocheckcertificate': True,
+    'ignoreerrors': False,
+    'logtostderr': False,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'auto',
+    'source_address': '0.0.0.0' # bind to ipv4 since ipv6 addresses cause issues sometimes
+}
+
+ffmpeg_options = {
+    'before_options': '-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -err_detect ignore_err',
+    'options': '-vn'
+}
+
+
+ytdl = youtube_dl.YoutubeDL(ytdl_format_options)
+
+
+class YTDLSource(discord.PCMVolumeTransformer):
+    def __init__(self, source, *, data, volume=0.5):
+        super().__init__(source, volume)
+
+        self.data = data
+
+        self.title = data.get('title')
+        self.url = data.get('url')
+
+    @classmethod
+    async def from_url(cls, url, *, loop=None, stream=False):
+        loop = loop or asyncio.get_event_loop()
+        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+
+        if 'entries' in data:
+            # take first item from a playlist
+            data = data['entries'][0]
+
+        filename = data['url'] if stream else ytdl.prepare_filename(data)
+        return cls(discord.FFmpegPCMAudio(filename, **ffmpeg_options), data=data)
+
+class Music(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+
+    @commands.command()
+    async def join(self, ctx, *, channel: discord.VoiceChannel):
+        """Joins a voice channel"""
+        if ctx.voice_client is not None:
+            return await ctx.voice_client.move_to(channel)
+        await channel.connect()
+
+    @commands.command()
+    async def play(self, ctx, *, query):
+        """Plays a file from the local filesystem or a URL"""
+        source = discord.PCMVolumeTransformer(discord.FFmpegPCMAudio(query))
+        ctx.voice_client.play(source, after=lambda e: print(f'Player error: {e}') if e else None)
+        await ctx.send(f'Now playing: {query}')
+
+    @commands.command()
+    async def yt(self, ctx, *, url):
+        """Plays from a url (almost anything youtube_dl supports)"""
+        async with ctx.typing():
+            player = await YTDLSource.from_url(url, loop=self.bot.loop)
+            ctx.voice_client.play(player, after=lambda e: print(f'Player error: {e}') if e else None)
+        await ctx.send(f'Now playing: {player.title}')
+
+    @commands.command()
+    async def stream(self, ctx, *, url):
+        """Streams from a url (same as yt, but doesn't predownload)"""
+        async with ctx.typing():
+            player = await YTDLSource.from_url(url, loop=self.bot.loop, stream=True)
+            ctx.voice_client.play(player, after=lambda e: print(f'Player error: {e}') if e else None)
+        await ctx.send(f'Now playing: {player.title}')
+
+    @commands.command()
+    async def volume(self, ctx, volume: int):
+        """Changes the player's volume"""
+        if ctx.voice_client is None:
+            return await ctx.send("Not connected to a voice channel.")
+        ctx.voice_client.source.volume = volume / 100
+        await ctx.send(f"Changed volume to {volume}%")
+    @commands.command()
+    async def stop(self, ctx):
+        """Stops and disconnects the bot from voice"""
+        await ctx.voice_client.disconnect()
+
+    @play.before_invoke
+    @yt.before_invoke
+    @stream.before_invoke
+    async def ensure_voice(self, ctx):
+        if ctx.voice_client is None:
+            if ctx.author.voice:
+                await ctx.author.voice.channel.connect()
+            else:
+                await ctx.send("You are not connected to a voice channel.")
+                raise commands.CommandError("Author not connected to a voice channel.")
+        elif ctx.voice_client.is_playing():
+            ctx.voice_client.stop()
+
+    def __init__(self, bot):
+        self.bot = bot
+        self.song_queue = []
+        self.current_song = None
+        self.loop = False
+
+    
+
+  
+
+
+    
+
+   
+    
+   
+
+   
+    
+intents = discord.Intents.default()
+intents.message_content = True 
+
+bot = commands.Bot(
+    command_prefix=commands.when_mentioned_or("!"),
+    description='Relatively simple music bot example',
+    intents=intents,
+)
+
+# Global variable for bot start time, to be set in on_ready
+BOT_START_TIME = None
 
 @bot.event
 async def on_ready():
-    print('Bot is ready.')
+    global BOT_START_TIME
+    BOT_START_TIME = datetime.datetime.utcnow()
+    if not hasattr(bot, 'start_time'): # If cog didn't set it first
+        bot.start_time = BOT_START_TIME
+    print(f'Logged in as {bot.user} (ID: {bot.user.id})')
+    print('------')
+
+# --- Moderation Cog ---
+class Moderation(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.user_warnings = {} # {guild_id: {user_id: [{"id": int, "moderator_id": int, "moderator_name": str, "reason": str, "timestamp": str}]}}
+
+    def create_action_footer(self, ctx, include_timestamp=False):
+        text = f"Action by {ctx.author.display_name}"
+        if include_timestamp: # Timestamps are now added via embed's timestamp field for most mod actions
+             text += f" | {datetime.datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        return text
+
+    @commands.command()
+    @commands.has_permissions(kick_members=True)
+    @commands.bot_has_permissions(kick_members=True)
+    async def kick(self, ctx, member: discord.Member, *, reason: str = "No reason provided"):
+        """Kicks a member from the server."""
+        if member == ctx.author:
+            embed = discord.Embed(title="🚫 Error", description="You cannot kick yourself.", color=discord.Color.red())
+            await ctx.send(embed=embed)
+            return
+        if member.top_role >= ctx.author.top_role and ctx.guild.owner != ctx.author:
+            embed = discord.Embed(title="🚫 Error", description="You cannot kick a member with a higher or equal role.", color=discord.Color.red())
+            await ctx.send(embed=embed)
+            return
+        if member.top_role >= ctx.guild.me.top_role:
+            embed = discord.Embed(title="🚫 Error", description="I cannot kick a member with a higher or equal role than me.", color=discord.Color.red())
+            await ctx.send(embed=embed)
+            return
+
+        dm_embed = discord.Embed(title="🚫 You Have Been Kicked", color=discord.Color.dark_red())
+        dm_embed.add_field(name="Server", value=ctx.guild.name, inline=False)
+        dm_embed.add_field(name="Reason", value=reason, inline=False)
+        dm_embed.add_field(name="Moderator", value=f"{ctx.author.name}#{ctx.author.discriminator}", inline=False)
+        try:
+            await member.send(embed=dm_embed)
+        except discord.Forbidden:
+            pass
+
+        try:
+            await member.kick(reason=reason)
+        except discord.HTTPException as e:
+            embed = discord.Embed(title="🚫 Kick Failed", description=f"An error occurred: {e}", color=discord.Color.red())
+            await ctx.send(embed=embed)
+            return
+
+        embed = discord.Embed(title="🚫 User Kicked", color=discord.Color.dark_red(), timestamp=datetime.datetime.utcnow())
+        if member.avatar:
+            embed.set_thumbnail(url=member.avatar.url)
+        embed.add_field(name="User", value=f"{member.mention} ({member.id})", inline=False)
+        embed.add_field(name="Moderator", value=ctx.author.mention, inline=True)
+        embed.add_field(name="Reason", value=reason, inline=True)
+        embed.set_footer(text=self.create_action_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    @commands.has_permissions(ban_members=True)
+    @commands.bot_has_permissions(ban_members=True)
+    async def ban(self, ctx, member: discord.User, *, reason: str = "No reason provided"): # Changed to discord.User for banning users not in server
+        """Bans a user from the server."""
+        if member == ctx.author:
+            embed = discord.Embed(title="🚫 Error", description="You cannot ban yourself.", color=discord.Color.red())
+            await ctx.send(embed=embed)
+            return
+        
+        # If member is discord.Member, check roles
+        if isinstance(member, discord.Member):
+            if member.top_role >= ctx.author.top_role and ctx.guild.owner != ctx.author:
+                embed = discord.Embed(title="🚫 Error", description="You cannot ban a member with a higher or equal role.", color=discord.Color.red())
+                await ctx.send(embed=embed)
+                return
+            if member.top_role >= ctx.guild.me.top_role:
+                embed = discord.Embed(title="🚫 Error", description="I cannot ban a member with a higher or equal role than me.", color=discord.Color.red())
+                await ctx.send(embed=embed)
+                return
+        try:
+            await ctx.guild.fetch_ban(member)
+            embed = discord.Embed(title="🚫 Ban Error", description=f"{member.display_name} is already banned.", color=discord.Color.red())
+            await ctx.send(embed=embed)
+            return
+        except discord.NotFound:
+            pass 
+
+        dm_embed = discord.Embed(title="🚫 You Have Been Banned",color=discord.Color.dark_red())
+        dm_embed.add_field(name="Server", value=ctx.guild.name, inline=False)
+        dm_embed.add_field(name="Reason", value=reason, inline=False)
+        dm_embed.add_field(name="Moderator", value=f"{ctx.author.name}#{ctx.author.discriminator}", inline=False)
+        try:
+            await member.send(embed=dm_embed)
+        except discord.Forbidden:
+            pass 
+        except AttributeError: # discord.User might not have send
+             pass
 
 
-@bot.command(name="server")
-async def server(ctx: commands.Context, server_name: str) -> None:
-    """Responds with the server address for a given server."""
-    if server_name.lower() == "hypixel":
-        await ctx.send("The server address for Hypixel is `mc.hypixel.net`.")
-    elif server_name.lower() == "herobrine":
-        await ctx.send("The server address for Herobrine is `herobrine.org`.")
-    else:
-        await ctx.send("Sorry, I don't have the server address for that server.")
+        try:
+            await ctx.guild.ban(member, reason=reason, delete_message_days=0) # delete_message_days=0 is default
+        except discord.HTTPException as e:
+            embed = discord.Embed(title="🚫 Ban Failed", description=f"An error occurred: {e}", color=discord.Color.red())
+            await ctx.send(embed=embed)
+            return
+
+        embed = discord.Embed(title="🚫 User Banned",color=discord.Color.dark_red(),timestamp=datetime.datetime.utcnow())
+        if member.avatar:
+            embed.set_thumbnail(url=member.avatar.url)
+        embed.add_field(name="User", value=f"{member.name}#{member.discriminator} ({member.id})", inline=False)
+        embed.add_field(name="Moderator", value=ctx.author.mention, inline=True)
+        embed.add_field(name="Reason", value=reason, inline=True)
+        embed.set_footer(text=self.create_action_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    def parse_duration(self, duration_str: str) -> int:
+        duration_str = duration_str.lower()
+        value = int(duration_str[:-1])
+        unit = duration_str[-1]
+        if unit == 's': return value
+        elif unit == 'm': return value * 60
+        elif unit == 'h': return value * 60 * 60
+        elif unit == 'd': return value * 60 * 60 * 24
+        elif unit == 'w': return value * 60 * 60 * 24 * 7
+        else: raise ValueError("Invalid duration unit. Use s, m, h, d, w.")
+
+    @commands.command()
+    @commands.has_permissions(manage_roles=True) 
+    @commands.bot_has_permissions(manage_roles=True)
+    async def mute(self, ctx, member: discord.Member, duration_str: str, *, reason: str = "No reason provided"):
+        MUTED_ROLE_NAME = "Muted" 
+        if member == ctx.author:
+            await ctx.send(embed=discord.Embed(title="🚫 Error", description="You cannot mute yourself.", color=discord.Color.red())); return
+        if member.top_role >= ctx.author.top_role and ctx.guild.owner != ctx.author:
+            await ctx.send(embed=discord.Embed(title="🚫 Error", description="You cannot mute a member with a higher or equal role.", color=discord.Color.red())); return
+        if member.top_role >= ctx.guild.me.top_role:
+            await ctx.send(embed=discord.Embed(title="🚫 Error", description="I cannot mute a member with a higher or equal role than me.", color=discord.Color.red())); return
+
+        muted_role = discord.utils.get(ctx.guild.roles, name=MUTED_ROLE_NAME)
+        if not muted_role:
+            await ctx.send(embed=discord.Embed(title="🚫 Error", description=f"The '{MUTED_ROLE_NAME}' role was not found. Please create it.", color=discord.Color.red())); return
+        if muted_role in member.roles:
+            await ctx.send(embed=discord.Embed(title="⚠️ Already Muted", description=f"{member.display_name} is already muted.", color=discord.Color.orange())); return
+        try:
+            duration_seconds = self.parse_duration(duration_str)
+            if duration_seconds <= 0: raise ValueError("Duration must be positive.")
+        except ValueError as e:
+            await ctx.send(embed=discord.Embed(title="🚫 Invalid Duration", description=f"Error: {e}. Example: `1h`, `30m`, `1d`.", color=discord.Color.red())); return
+
+        dm_embed = discord.Embed(title="🔇 You Have Been Muted", color=discord.Color.orange())
+        dm_embed.add_field(name="Server", value=ctx.guild.name, inline=False)
+        dm_embed.add_field(name="Reason", value=reason, inline=False)
+        dm_embed.add_field(name="Duration", value=duration_str, inline=False)
+        dm_embed.add_field(name="Moderator", value=f"{ctx.author.name}#{ctx.author.discriminator}", inline=False)
+        try: await member.send(embed=dm_embed)
+        except discord.Forbidden: pass 
+
+        try: await member.add_roles(muted_role, reason=f"Muted by {ctx.author.name} for {reason}")
+        except discord.HTTPException as e:
+            await ctx.send(embed=discord.Embed(title="🚫 Mute Failed", description=f"An error occurred: {e}", color=discord.Color.red())); return
+
+        s_embed = discord.Embed(title="🔇 User Muted", color=discord.Color.orange(), timestamp=datetime.datetime.utcnow())
+        if member.avatar: s_embed.set_thumbnail(url=member.avatar.url)
+        s_embed.add_field(name="User", value=f"{member.mention} ({member.id})", inline=False)
+        s_embed.add_field(name="Moderator", value=ctx.author.mention, inline=True)
+        s_embed.add_field(name="Reason", value=reason, inline=True)
+        s_embed.add_field(name="Duration", value=duration_str, inline=False)
+        s_embed.set_footer(text=self.create_action_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=s_embed)
+
+        await asyncio.sleep(duration_seconds)
+        try:
+            member = await ctx.guild.fetch_member(member.id) 
+            if muted_role in member.roles:
+                await member.remove_roles(muted_role, reason="Mute duration expired.")
+                log_embed = discord.Embed(title="🔊 User Automatically Unmuted", color=discord.Color.green(), timestamp=datetime.datetime.utcnow())
+                if member.avatar: log_embed.set_thumbnail(url=member.avatar.url)
+                log_embed.add_field(name="User", value=f"{member.mention} ({member.id})", inline=False)
+                log_embed.add_field(name="Original Mute Reason", value=reason, inline=True)
+                log_embed.add_field(name="Mute Duration", value=duration_str, inline=True)
+                await ctx.send(embed=log_embed) 
+        except discord.NotFound: pass 
+        except discord.HTTPException as e: print(f"Failed to auto-unmute {member.id} in {ctx.guild.id}: {e}")
+
+    @commands.command()
+    @commands.has_permissions(manage_roles=True)
+    @commands.bot_has_permissions(manage_roles=True)
+    async def unmute(self, ctx, member: discord.Member, *, reason: str = "No reason provided"):
+        MUTED_ROLE_NAME = "Muted"
+        if member.top_role >= ctx.guild.me.top_role and member != ctx.guild.me :
+            await ctx.send(embed=discord.Embed(title="🚫 Error", description="I cannot unmute a member with a higher or equal role.", color=discord.Color.red())); return
+        muted_role = discord.utils.get(ctx.guild.roles, name=MUTED_ROLE_NAME)
+        if not muted_role:
+            await ctx.send(embed=discord.Embed(title="🚫 Error", description=f"The '{MUTED_ROLE_NAME}' role was not found.", color=discord.Color.red())); return
+        if muted_role not in member.roles:
+            await ctx.send(embed=discord.Embed(title="⚠️ Not Muted", description=f"{member.display_name} is not currently muted.", color=discord.Color.orange())); return
+
+        dm_embed = discord.Embed(title="🔊 You Have Been Unmuted", color=discord.Color.green())
+        dm_embed.add_field(name="Server", value=ctx.guild.name, inline=False); dm_embed.add_field(name="Reason", value=reason, inline=False)
+        dm_embed.add_field(name="Moderator", value=f"{ctx.author.name}#{ctx.author.discriminator}", inline=False)
+        try: await member.send(embed=dm_embed)
+        except discord.Forbidden: pass
+
+        try: await member.remove_roles(muted_role, reason=f"Unmuted by {ctx.author.name} for {reason}")
+        except discord.HTTPException as e:
+            await ctx.send(embed=discord.Embed(title="🚫 Unmute Failed", description=f"An error occurred: {e}", color=discord.Color.red())); return
+        
+        s_embed = discord.Embed(title="🔊 User Unmuted", color=discord.Color.green(), timestamp=datetime.datetime.utcnow())
+        if member.avatar: s_embed.set_thumbnail(url=member.avatar.url)
+        s_embed.add_field(name="User", value=f"{member.mention} ({member.id})", inline=False)
+        s_embed.add_field(name="Moderator", value=ctx.author.mention, inline=True); s_embed.add_field(name="Reason", value=reason, inline=True)
+        s_embed.set_footer(text=self.create_action_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=s_embed)
+
+    @commands.command(aliases=['purge'])
+    @commands.has_permissions(manage_messages=True)
+    @commands.bot_has_permissions(manage_messages=True)
+    async def clear(self, ctx, amount: int):
+        if amount <= 0:
+            await ctx.send(embed=discord.Embed(title="🚫 Invalid Amount", description="Number of messages to clear must be positive.", color=discord.Color.red())); return
+        if amount > 99: 
+            await ctx.send(embed=discord.Embed(title="🚫 Amount Too High", description="You can clear up to 99 messages at a time.", color=discord.Color.red())); return
+        try:
+            deleted = await ctx.channel.purge(limit=amount + 1)
+            s_embed = discord.Embed(title="🗑️ Messages Cleared", description=f"Successfully cleared {len(deleted)-1} message(s) in {ctx.channel.mention}.", color=discord.Color.blue(), timestamp=datetime.datetime.utcnow())
+            s_embed.set_footer(text=self.create_action_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+            await ctx.send(embed=s_embed, delete_after=5)
+        except discord.HTTPException as e:
+            await ctx.send(embed=discord.Embed(title="🚫 Clear Failed", description=f"An error occurred: {e}", color=discord.Color.red()))
+
+    @commands.command()
+    @commands.has_permissions(kick_members=True) 
+    async def warn(self, ctx, member: discord.Member, *, reason: str = "No reason provided"):
+        if member == ctx.author: await ctx.send(embed=discord.Embed(title="🚫 Error", description="You cannot warn yourself.", color=discord.Color.red())); return
+        if member.bot: await ctx.send(embed=discord.Embed(title="🚫 Error", description="You cannot warn a bot.", color=discord.Color.red())); return
+        if member.top_role >= ctx.author.top_role and ctx.guild.owner != ctx.author:
+            await ctx.send(embed=discord.Embed(title="🚫 Error", description="You cannot warn a member with a higher or equal role.", color=discord.Color.red())); return
+
+        gid = ctx.guild.id; uid = member.id
+        self.user_warnings.setdefault(gid, {}).setdefault(uid, [])
+        warn_entry = {"id": len(self.user_warnings[gid][uid]) + 1, "mod_id": ctx.author.id, "mod_name": str(ctx.author), "reason": reason, "ts": datetime.datetime.utcnow().isoformat()}
+        self.user_warnings[gid][uid].append(warn_entry)
+
+        dm_embed = discord.Embed(title="⚠️ You Have Been Warned", color=discord.Color.orange())
+        dm_embed.add_field(name="Server", value=ctx.guild.name, inline=False); dm_embed.add_field(name="Reason", value=reason, inline=False)
+        dm_embed.add_field(name="Moderator", value=str(ctx.author), inline=False)
+        try: await member.send(embed=dm_embed)
+        except discord.Forbidden: pass
+
+        s_embed = discord.Embed(title="⚠️ User Warned", color=discord.Color.orange(), timestamp=datetime.datetime.utcnow())
+        if member.avatar: s_embed.set_thumbnail(url=member.avatar.url)
+        s_embed.add_field(name="User", value=f"{member.mention} ({uid})", inline=False)
+        s_embed.add_field(name="Moderator", value=ctx.author.mention, inline=True)
+        s_embed.add_field(name="Reason", value=reason, inline=True)
+        s_embed.add_field(name="Total Warnings", value=str(len(self.user_warnings[gid][uid])), inline=False)
+        s_embed.set_footer(text=self.create_action_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=s_embed)
+
+    @commands.command(aliases=['listwarnings', 'viewwarnings'])
+    @commands.has_permissions(kick_members=True)
+    async def warnings(self, ctx, member: discord.Member):
+        gid = ctx.guild.id; uid = member.id
+        if not self.user_warnings.get(gid, {}).get(uid):
+            embed = discord.Embed(title="📝 User Warnings", description=f"{member.display_name} has no warnings.", color=discord.Color.green())
+            if member.avatar: embed.set_thumbnail(url=member.avatar.url)
+            embed.set_footer(text=f"Requested by {ctx.author.display_name}", icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+            await ctx.send(embed=embed); return
+
+        warns = self.user_warnings[gid][uid]
+        embed = discord.Embed(title=f"📝 Warnings for {member.display_name}", color=discord.Color.gold(), timestamp=datetime.datetime.utcnow())
+        if member.avatar: embed.set_thumbnail(url=member.avatar.url)
+        desc = [f"**ID: {w['id']}** | Mod: {w['mod_name']}\nReason: {w['reason']}\nDate: {datetime.datetime.fromisoformat(w['ts']).strftime('%Y-%m-%d %H:%M UTC')}\n---" for w in warns]
+        embed.description = "\n".join(desc)
+        embed.set_footer(text=f"Requested by {ctx.author.display_name}", icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    @commands.command(aliases=['removewarning', 'delwarn'])
+    @commands.has_permissions(kick_members=True)
+    async def unwarn(self, ctx, member: discord.Member, warning_id: int):
+        gid = ctx.guild.id; uid = member.id
+        if not self.user_warnings.get(gid, {}).get(uid):
+            await ctx.send(embed=discord.Embed(title="🚫 Unwarn Error", description=f"{member.display_name} has no warnings.", color=discord.Color.red())); return
+        
+        warn_idx = next((i for i, warn in enumerate(self.user_warnings[gid][uid]) if warn["id"] == warning_id), -1)
+        if warn_idx == -1:
+            await ctx.send(embed=discord.Embed(title="🚫 Unwarn Error", description=f"Warning ID {warning_id} not found for {member.display_name}.", color=discord.Color.red())); return
+
+        self.user_warnings[gid][uid].pop(warn_idx)
+        s_embed = discord.Embed(title="✅ Warning Removed", description=f"Removed warning ID **{warning_id}** for {member.mention}.", color=discord.Color.green(), timestamp=datetime.datetime.utcnow())
+        if member.avatar: s_embed.set_thumbnail(url=member.avatar.url)
+        s_embed.add_field(name="Moderator", value=ctx.author.mention, inline=False)
+        s_embed.set_footer(text=self.create_action_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=s_embed)
+
+    @commands.command()
+    @commands.has_permissions(kick_members=True, ban_members=True)
+    @commands.bot_has_permissions(ban_members=True)
+    async def softban(self, ctx, member: discord.Member, *, reason: str = "No reason provided - recent messages cleared."):
+        if member == ctx.author: await ctx.send(embed=discord.Embed(title="🚫 Error", description="You cannot softban yourself.", color=discord.Color.red())); return
+        if member.top_role >= ctx.author.top_role and ctx.guild.owner != ctx.author:
+            await ctx.send(embed=discord.Embed(title="🚫 Error", description="You cannot softban a member with a higher or equal role.", color=discord.Color.red())); return
+        if member.top_role >= ctx.guild.me.top_role:
+            await ctx.send(embed=discord.Embed(title="🚫 Error", description="I cannot softban a member with a higher or equal role.", color=discord.Color.red())); return
+
+        dm_embed = discord.Embed(title="💨 You Were Briefly Softbanned", color=discord.Color.orange())
+        dm_embed.add_field(name="Server", value=ctx.guild.name, inline=False); dm_embed.add_field(name="Reason", value=f"{reason} (clears messages)", inline=False)
+        dm_embed.add_field(name="Moderator", value=str(ctx.author), inline=False)
+        try: await member.send(embed=dm_embed)
+        except discord.Forbidden: pass
+
+        try:
+            await member.ban(reason=f"Softban by {str(ctx.author)}: {reason}", delete_message_days=1)
+            await ctx.guild.unban(member, reason=f"Automatic unban after softban by {str(ctx.author)}")
+        except discord.HTTPException as e:
+            await ctx.send(embed=discord.Embed(title="🚫 Softban Failed", description=f"An error occurred: {e}", color=discord.Color.red())); return
+        
+        s_embed = discord.Embed(title="💨 User Softbanned", description=f"{member.mention} was softbanned. Messages cleared.", color=discord.Color.orange(), timestamp=datetime.datetime.utcnow())
+        if member.avatar: s_embed.set_thumbnail(url=member.avatar.url)
+        s_embed.add_field(name="Moderator", value=ctx.author.mention, inline=True); s_embed.add_field(name="Reason", value=reason, inline=True)
+        s_embed.set_footer(text=self.create_action_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=s_embed)
+
+    @commands.command(aliases=['setnick', 'nickname'])
+    @commands.has_permissions(manage_nicknames=True)
+    @commands.bot_has_permissions(manage_nicknames=True)
+    async def nick(self, ctx, member: discord.Member, *, new_nick: str = None):
+        if member.top_role >= ctx.author.top_role and ctx.guild.owner != ctx.author :
+             await ctx.send(embed=discord.Embed(title="🚫 Error", description="Cannot change nickname of member with higher/equal role.", color=discord.Color.red())); return
+        if member.top_role >= ctx.guild.me.top_role and member != ctx.guild.me:
+            await ctx.send(embed=discord.Embed(title="🚫 Error", description="I cannot change nickname of member with higher/equal role.", color=discord.Color.red())); return
+        if new_nick and len(new_nick) > 32:
+            await ctx.send(embed=discord.Embed(title="🚫 Nickname Error", description="Nickname too long (max 32 chars).", color=discord.Color.red())); return
+
+        old_nick = member.display_name
+        try: await member.edit(nick=new_nick, reason=f"Nickname change by {str(ctx.author)}")
+        except discord.HTTPException as e:
+            await ctx.send(embed=discord.Embed(title="🚫 Nickname Change Failed", description=f"Error: {e}", color=discord.Color.red())); return
+
+        desc = f"Changed nickname for {member.mention} from **{old_nick}** to **{new_nick or member.name}**."
+        if new_nick is None: desc = f"Cleared nickname for {member.mention} (was **{old_nick}**)."
+        s_embed = discord.Embed(title="📛 Nickname Changed", description=desc, color=discord.Color.blue(), timestamp=datetime.datetime.utcnow())
+        if member.avatar: s_embed.set_thumbnail(url=member.avatar.url)
+        s_embed.set_footer(text=self.create_action_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=s_embed)
+
+    @commands.command()
+    @commands.has_permissions(manage_channels=True)
+    @commands.bot_has_permissions(manage_channels=True) # manage_roles for overwrites also, but manage_channels for edit itself
+    async def slowmode(self, ctx, channel: discord.TextChannel = None, *, duration_str: str = "0s"):
+        channel = channel or ctx.channel
+        try:
+            delay = self.parse_duration(duration_str)
+            if not (0 <= delay <= 21600): 
+                await ctx.send(embed=discord.Embed(title="🚫 Invalid Duration", description="Slowmode: 0s to 6h.", color=discord.Color.red())); return
+        except ValueError as e:
+            await ctx.send(embed=discord.Embed(title="🚫 Invalid Duration", description=f"Error: {e}. Example: `30s`, `1h`.", color=discord.Color.red())); return
+        try: await channel.edit(slowmode_delay=delay, reason=f"Slowmode by {str(ctx.author)}")
+        except discord.HTTPException as e:
+            await ctx.send(embed=discord.Embed(title="🚫 Slowmode Change Failed", description=f"Error: {e}", color=discord.Color.red())); return
+        
+        action = "disabled" if delay == 0 else f"set to **{duration_str}**"
+        s_embed = discord.Embed(title="⏳ Slowmode Updated", description=f"Slowmode for {channel.mention} {action}.", color=discord.Color.orange(), timestamp=datetime.datetime.utcnow())
+        s_embed.set_footer(text=self.create_action_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=s_embed)
+
+    @commands.command()
+    @commands.has_permissions(manage_channels=True) 
+    @commands.bot_has_permissions(manage_roles=True) 
+    async def lock(self, ctx, channel: discord.TextChannel = None):
+        channel = channel or ctx.channel
+        overwrite = channel.overwrites_for(ctx.guild.default_role)
+        if overwrite.send_messages is False: 
+            await ctx.send(embed=discord.Embed(title="⚠️ Already Locked", description=f"{channel.mention} is already locked.", color=discord.Color.orange())); return
+        overwrite.send_messages = False
+        try: await channel.set_permissions(ctx.guild.default_role, overwrite=overwrite, reason=f"Lock by {str(ctx.author)}")
+        except discord.HTTPException as e:
+            await ctx.send(embed=discord.Embed(title="🚫 Lock Failed", description=f"Error: {e}", color=discord.Color.red())); return
+        s_embed = discord.Embed(title="🔒 Channel Locked", description=f"{channel.mention} locked.", color=discord.Color.dark_orange(), timestamp=datetime.datetime.utcnow())
+        s_embed.set_footer(text=self.create_action_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=s_embed)
+
+    @commands.command()
+    @commands.has_permissions(manage_channels=True)
+    @commands.bot_has_permissions(manage_roles=True)
+    async def unlock(self, ctx, channel: discord.TextChannel = None):
+        channel = channel or ctx.channel
+        overwrite = channel.overwrites_for(ctx.guild.default_role)
+        if overwrite.send_messages is not False: # If None or True, it's effectively unlocked
+            await ctx.send(embed=discord.Embed(title="⚠️ Already Unlocked", description=f"{channel.mention} is not locked.", color=discord.Color.orange())); return
+        overwrite.send_messages = None # Reset to default (or True)
+        try: await channel.set_permissions(ctx.guild.default_role, overwrite=overwrite, reason=f"Unlock by {str(ctx.author)}")
+        except discord.HTTPException as e:
+            await ctx.send(embed=discord.Embed(title="🚫 Unlock Failed", description=f"Error: {e}", color=discord.Color.red())); return
+        s_embed = discord.Embed(title="🔓 Channel Unlocked", description=f"{channel.mention} unlocked.", color=discord.Color.green(), timestamp=datetime.datetime.utcnow())
+        s_embed.set_footer(text=self.create_action_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=s_embed)
+        
+    async def cog_command_error(self, ctx, error):
+        title = "🚫 Command Error"
+        description = "An unexpected error occurred."
+        color = discord.Color.red()
+        if isinstance(error, commands.MissingRequiredArgument):
+            title = "🚫 Missing Argument"; description = f"Missing: `{error.param.name}`. Check help."
+        elif isinstance(error, commands.BadArgument):
+            title = "🚫 Bad Argument"; description = f"Invalid argument. {error}"
+        elif isinstance(error, commands.CommandNotFound):
+            return # Should be handled by bot's global on_command_error
+        elif isinstance(error, commands.MissingPermissions):
+            title = "🚫 Permission Denied"; description = "You lack permissions." + "\nRequired: " + ", ".join(error.missing_permissions)
+        elif isinstance(error, commands.BotMissingPermissions):
+            title = "🚫 Bot Permission Denied"; description = "I lack permissions." + "\nRequired: " + ", ".join(error.missing_permissions)
+        elif isinstance(error, commands.MemberNotFound):
+            title = "🚫 Member Not Found"; description = f"Member `{error.argument}` not found."
+        elif isinstance(error, commands.UserNotFound):
+            title = "🚫 User Not Found"; description = f"User `{error.argument}` not found."
+        elif isinstance(error, commands.ChannelNotFound):
+            title = "🚫 Channel Not Found"; description = f"Channel `{error.argument}` not found."
+        elif isinstance(error, commands.NoPrivateMessage):
+            title = "🚫 Server Only"; description = "Command not for DMs."
+        else:
+            description = str(error)
+            print(f"Unhandled error in Moderation cog: {error.__class__.__name__} - {error}")
+
+        embed = discord.Embed(title=title, description=description, color=color, timestamp=datetime.datetime.utcnow())
+        embed.set_footer(text=f"Error in '{ctx.command}'")
+        await ctx.send(embed=embed)
+
+# --- UtilityCommands Cog ---
+class UtilityCommands(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        # BOT_START_TIME will be set in the on_ready event
+        # For uptime command, we'll retrieve it from bot instance if set there,
+        # or use the global if preferred. Let's assume it's set on the bot instance.
+        if not hasattr(self.bot, 'start_time'): # Ensure it's only set once
+            self.bot.start_time = datetime.datetime.utcnow()
 
 
-@bot.command(name="spin")
-async def spin(ctx: commands.Context) -> None:
-    """Sends a random GIF in an embed."""
-    url = ["https://i.kym-cdn.com/photos/images/newsfeed/001/879/084/63d.gif"]
-    embed = discord.Embed()
-    embed.set_image(url=url)
-    await ctx.send(embed=embed)
+    # Helper for footer
+    def create_utility_footer(self, ctx):
+        return f"Requested by {ctx.author.display_name}"
+
+    # Generic error handler for UtilityCommands
+    async def cog_command_error(self, ctx, error):
+        title = "⚙️ Command Error ⚙️"
+        description = "An unexpected error occurred with this utility command."
+        color = discord.Color.red()
+
+        if isinstance(error, commands.MissingRequiredArgument):
+            title = "⚙️ Missing Argument"; description = f"Oops! You missed the `{error.param.name}` argument. Please provide it."
+        elif isinstance(error, commands.BadArgument):
+            title = "⚙️ Invalid Argument"; description = f"The argument you provided isn't quite right. {error}"
+        elif isinstance(error, commands.MemberNotFound):
+            title = "⚙️ Member Not Found"; description = f"I couldn't find the member: `{error.argument}`."
+        elif isinstance(error, commands.UserNotFound):
+            title = "⚙️ User Not Found"; description = f"User `{error.argument}` could not be found."
+        elif isinstance(error, commands.ChannelNotFound):
+            title = "⚙️ Channel Not Found"; description = f"I couldn't find the channel: `{error.argument}`."
+        elif isinstance(error, commands.RoleNotFound):
+            title = "⚙️ Role Not Found"; description = f"That role, `{error.argument}`, doesn't seem to exist."
+        elif isinstance(error, commands.CommandInvokeError) and isinstance(error.original, (SyntaxError, ValueError)): # For calc
+            title = "⚙️ Calculation Error"; description = f"I couldn't calculate that expression. Please check its format. Error: {error.original}"
+        else:
+            description = f"Something went wrong: {error}"
+            print(f"Unhandled error in UtilityCommands cog: {error.__class__.__name__} - {error}")
+
+        embed = discord.Embed(title=title, description=description, color=color, timestamp=datetime.datetime.utcnow())
+        embed.set_footer(text="Need help? Use the help command for this utility!")
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    async def ping(self, ctx):
+        """Checks the bot's latency."""
+        latency_ms = round(self.bot.latency * 1000)
+        embed = discord.Embed(
+            title="🏓 Pong!",
+            description=f"Latency: **{latency_ms}ms**",
+            color=discord.Color.blue(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.set_footer(text=self.create_utility_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    @commands.command(aliases=['chaninfo'])
+    async def channelinfo(self, ctx, *, channel: discord.abc.GuildChannel = None):
+        """Displays information about a channel. Defaults to the current channel."""
+        if channel is None:
+            channel = ctx.channel
+
+        embed = discord.Embed(
+            title=f"📊 Channel Information: #{channel.name}",
+            color=discord.Color.dark_teal(),
+            timestamp=channel.created_at # Show channel creation date as timestamp
+        )
+        if ctx.guild.icon: # Use guild icon as thumbnail
+            embed.set_thumbnail(url=ctx.guild.icon.url)
+
+        embed.add_field(name="🆔 ID", value=channel.id, inline=True)
+        embed.add_field(name="<:channel:12345> Type", value=str(channel.type).capitalize(), inline=True) # Placeholder emoji
+        if channel.category:
+            embed.add_field(name="📁 Category", value=channel.category.name, inline=True)
+        
+        embed.add_field(name="🔢 Position", value=channel.position, inline=True)
+        
+        if isinstance(channel, discord.TextChannel):
+            if channel.topic:
+                embed.add_field(name="📝 Topic", value=channel.topic, inline=False)
+            embed.add_field(name=" Slowmode", value=f"{channel.slowmode_delay}s" if channel.slowmode_delay > 0 else "Off", inline=True)
+            embed.add_field(name=" Members (approx)", value=str(len(channel.members)), inline=True) # Approximate, only cached members
+        elif isinstance(channel, discord.VoiceChannel):
+            embed.add_field(name="🔊 Bitrate", value=f"{channel.bitrate / 1000}kbps", inline=True)
+            embed.add_field(name="👥 User Limit", value=str(channel.user_limit) if channel.user_limit > 0 else "Unlimited", inline=True)
+            embed.add_field(name=" Members Connected", value=str(len(channel.members)), inline=True)
+        
+        embed.set_footer(text=f"Requested by {ctx.author.display_name} | Channel Created", icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    async def roleinfo(self, ctx, *, role: discord.Role):
+        """Displays information about a role."""
+        embed = discord.Embed(
+            title=f"🎭 Role Information: {role.name}",
+            color=role.color if role.color != discord.Color.default() else discord.Color.light_grey(),
+            timestamp=role.created_at # Show role creation date
+        )
+        # if role.icon: # Role icons are a new feature, might need specific handling or asset URL
+        #    embed.set_thumbnail(url=role.icon.url)
+        # elif role.unicode_emoji:
+        #    embed.add_field(name="Icon Emoji", value=role.unicode_emoji, inline=True)
 
 
-@bot.command(name="purge")
-@commands.has_permissions(manage_messages=True)
-async def purge_command(ctx, amount: int) -> None:
-    """Deletes a specified amount of messages from the current channel."""
-    await ctx.message.delete()  # Delete the user's command message
+        embed.add_field(name="🆔 ID", value=role.id, inline=True)
+        embed.add_field(name="🎨 Color", value=str(role.color), inline=True)
+        embed.add_field(name="👥 Members", value=str(len(role.members)), inline=True)
+        
+        embed.add_field(name="🔢 Position", value=role.position, inline=True)
+        embed.add_field(name="🛡️ Hoisted", value="Yes" if role.hoist else "No", inline=True)
+        embed.add_field(name="멘션 가능", value="Yes" if role.mentionable else "No", inline=True) # Mentionable in Korean
 
-    if amount < 1:
-        await ctx.send("Please provide a positive number of messages to delete.")
-        return
+        # Key Permissions (example)
+        perms = []
+        if role.permissions.administrator: perms.append("Administrator")
+        if role.permissions.kick_members: perms.append("Kick Members")
+        if role.permissions.ban_members: perms.append("Ban Members")
+        if role.permissions.manage_channels: perms.append("Manage Channels")
+        if role.permissions.manage_guild: perms.append("Manage Server")
+        if role.permissions.view_audit_log: perms.append("View Audit Log")
+        
+        if perms:
+            embed.add_field(name="🔑 Key Permissions", value=", ".join(perms[:5]) + ("..." if len(perms) > 5 else ""), inline=False)
+        else:
+            embed.add_field(name="🔑 Key Permissions", value="None notable (or default)", inline=False)
 
-    deleted = await ctx.channel.purge(limit=amount)
-    await ctx.send(f"Deleted {len(deleted)} messages.")
+        embed.set_footer(text=f"Requested by {ctx.author.display_name} | Role Created", icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    # Simplified duration parser for remindme (can be expanded)
+    def _parse_reminder_duration(self, time_str: str) -> tuple[int, str]:
+        """Parses a common time string (e.g., 10m, 1h, 2d) into seconds and a formatted string."""
+        time_str = time_str.lower()
+        value = int(time_str[:-1])
+        unit = time_str[-1]
+        seconds = 0
+        formatted_unit = ""
+
+        if unit == 's': seconds = value; formatted_unit = "second"
+        elif unit == 'm': seconds = value * 60; formatted_unit = "minute"
+        elif unit == 'h': seconds = value * 60 * 60; formatted_unit = "hour"
+        elif unit == 'd': seconds = value * 60 * 60 * 24; formatted_unit = "day"
+        else: raise ValueError("Invalid time unit. Use 's', 'm', 'h', or 'd'.")
+
+        if value > 1: formatted_unit += "s" # Pluralize
+        return seconds, f"{value} {formatted_unit}"
+
+    @commands.command(aliases=['remind', 'reminder'])
+    async def remindme(self, ctx, time_str: str, *, message: str):
+        """Sets a reminder. E.g., !remindme 10m Check the oven"""
+        try:
+            duration_seconds, formatted_duration_str = self._parse_reminder_duration(time_str)
+            if duration_seconds <= 0:
+                raise ValueError("Duration must be positive.")
+            # Optional: Add a maximum duration limit (e.g., 30 days)
+            if duration_seconds > 30 * 24 * 60 * 60: # Max 30 days
+                 await ctx.send(embed=discord.Embed(title="⚙️ Reminder Error", description="Sorry, I can only set reminders up to 30 days in advance.", color=discord.Color.red())); return
+
+        except ValueError as e:
+            embed = discord.Embed(
+                title="⚙️ Invalid Time Format",
+                description=f"Please use a valid time format (e.g., `10m`, `1h`, `2d`). Error: {e}",
+                color=discord.Color.orange(),
+                timestamp=datetime.datetime.utcnow()
+            )
+            await ctx.send(embed=embed)
+            return
+
+        target_time = datetime.datetime.utcnow() + datetime.timedelta(seconds=duration_seconds)
+        
+        embed_set = discord.Embed(
+            title="⏰ Reminder Set!",
+            description=f"Okay, {ctx.author.mention}, I will remind you about: **{message}**\nIn: **{formatted_duration_str}** (at {discord.utils.format_dt(target_time, style='F')}).",
+            color=discord.Color.green(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed_set.set_footer(text=self.create_utility_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed_set)
+
+        await asyncio.sleep(duration_seconds)
+
+        delivery_embed = discord.Embed(
+            title="⏰ Reminder!",
+            description=f"Hi {ctx.author.mention}, you asked me to remind you about: **{message}**",
+            color=discord.Color.blue(),
+            timestamp=datetime.datetime.utcnow() # Time of delivery
+        )
+        delivery_embed.add_field(name="Originally Set At", value=discord.utils.format_dt(target_time - datetime.timedelta(seconds=duration_seconds), style='R'), inline=False)
+        if ctx.guild:
+            delivery_embed.add_field(name="Server", value=ctx.guild.name, inline=False)
+        
+        try:
+            await ctx.author.send(embed=delivery_embed)
+        except discord.Forbidden:
+            # If DMs are closed, try sending in the original channel (if still accessible)
+            try:
+                await ctx.send(content=f"Hey {ctx.author.mention}, your reminder:", embed=delivery_embed)
+            except discord.HTTPException:
+                pass # Channel might be gone or no perms
+
+    @commands.command(aliases=['calculate', 'math'])
+    async def calc(self, ctx, *, expression: str):
+        """Calculates a mathematical expression."""
+        # WARNING: Using eval() is generally unsafe if the input is not strictly controlled.
+        # For a public bot, consider using a safer math parsing library (e.g., numexpr, asteval).
+        # Here, we'll use a very limited eval for demonstration.
+        allowed_chars = "0123456789+-*/(). " # Whitelist characters
+        if not all(char in allowed_chars for char in expression):
+            embed = discord.Embed(
+                title="🧮 Calculation Error 🧮",
+                description=f"Invalid characters in expression. Only numbers and `+ - * / ( ) .` are allowed.",
+                color=discord.Color.red(),
+                timestamp=datetime.datetime.utcnow()
+            )
+            await ctx.send(embed=embed)
+            return
+
+        try:
+            # A slightly safer eval by providing limited builtins and locals
+            result = eval(expression, {"__builtins__": {}}, {}) 
+        except (SyntaxError, ZeroDivisionError, TypeError, NameError, OverflowError) as e:
+            embed = discord.Embed(
+                title="🧮 Calculation Error 🧮",
+                description=f"Could not evaluate: `{expression}`\nError: `{e}`",
+                color=discord.Color.red(),
+                timestamp=datetime.datetime.utcnow()
+            )
+            await ctx.send(embed=embed)
+            return
+        except Exception as e: # Catch any other unexpected errors during eval
+            embed = discord.Embed(
+                title="🧮 Calculation Error 🧮",
+                description=f"An unexpected error occurred during calculation: `{expression}`\nError: `{e}`",
+                color=discord.Color.red(),
+                timestamp=datetime.datetime.utcnow()
+            )
+            await ctx.send(embed=embed)
+            return
 
 
-@bot.command()
-async def meme(ctx, category: str = 'memes'):
-    categories = ['memes', 'dankmemes', 'wholesomememes', 'me_irl', '2meirl4meirl', 'surrealmemes', 'terriblefacebookmemes', 'meirl', 'AdviceAnimals', 'crappydesign', 'forbiddensnacks', 'woooosh', 'insaneparents', 'facepalm', 'technicallythetruth', 'iamverysmart', 'holdmybeer', 'showerthoughts', 'blackpeopletwitter', 'whitepeopletwitter', 'interestingasfuck', 'funny', 'pics', 'aww', 'gifs', 'videos', 'science', 'food', 'news', 'movies', 'gay']
-    if category not in categories:
-        await ctx.send("Invalid category. Please choose one of the following categories: " + ", ".join(categories))
-        return
+        embed = discord.Embed(
+            title="🧮 Calculator 🧮",
+            color=discord.Color.dark_green(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.add_field(name="Expression", value=f"`{expression}`", inline=False)
+        embed.add_field(name="Result", value=f"`{result}`", inline=False)
+        embed.set_footer(text=self.create_utility_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    async def uptime(self, ctx):
+        """Shows how long the bot has been online."""
+        # BOT_START_TIME is set in on_ready, or by the cog's __init__ on bot.start_time
+        current_time = datetime.datetime.utcnow()
+        start_time_to_use = getattr(self.bot, 'start_time', BOT_START_TIME) # Use bot attribute first
+        
+        if start_time_to_use is None:
+            embed = discord.Embed(title="⏱️ Bot Uptime", description="Sorry, I couldn't determine my start time.", color=discord.Color.orange())
+            await ctx.send(embed=embed)
+            return
+
+        delta = current_time - start_time_to_use
+        
+        days = delta.days
+        hours, remainder = divmod(delta.seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        
+        uptime_str = f"{days}d {hours}h {minutes}m {seconds}s"
+        
+        embed = discord.Embed(
+            title="⏱️ Bot Uptime",
+            description=f"I have been online for: **{uptime_str}**",
+            color=discord.Color.light_grey(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.set_footer(text=self.create_utility_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    @commands.command(name="8ball")
+    async def eight_ball(self, ctx, *, question: str):
+        """Consults the Magic 8-Ball for an answer."""
+        responses = [
+            "It is certain.", "It is decidedly so.", "Without a doubt.", "Yes – definitely.",
+            "You may rely on it.", "As I see it, yes.", "Most likely.", "Outlook good.",
+            "Yes.", "Signs point to yes.", "Reply hazy, try again.", "Ask again later.",
+            "Better not tell you now.", "Cannot predict now.", "Concentrate and ask again.",
+            "Don't count on it.", "My reply is no.", "My sources say no.",
+            "Outlook not so good.", "Very doubtful."
+        ]
+        answer = random.choice(responses)
+        
+        embed = discord.Embed(
+            title="🎱 Magic 8-Ball 🎱",
+            color=discord.Color.dark_purple(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.add_field(name="❓ Question", value=question, inline=False)
+        embed.add_field(name="💬 Answer", value=answer, inline=False)
+        embed.set_footer(text=self.create_utility_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    @commands.command(aliases=['pick'])
+    async def choose(self, ctx, *, choices: str):
+        """Helps you choose between multiple options. Separate choices with 'or' or ','."""
+        # Try splitting by ' or ' first, then by ',' if ' or ' isn't found effectively
+        if ' or ' in choices.lower(): # Check for ' or ' to handle it as a primary delimiter
+            choices_list = [c.strip() for c in choices.split(r' or ')] # Regex might be better for multiple 'or's
+        else:
+            choices_list = [c.strip() for c in choices.split(',')]
+
+        choices_list = [c for c in choices_list if c] # Remove empty strings
+
+        if len(choices_list) < 2:
+            embed = discord.Embed(
+                title="🤔 Need More Choices 🤔",
+                description="Please give me at least two options to choose from!",
+                color=discord.Color.orange(),
+                timestamp=datetime.datetime.utcnow()
+            )
+            await ctx.send(embed=embed)
+            return
+
+        chosen = random.choice(choices_list)
+        embed = discord.Embed(
+            title="🤔 Choice Machine 🤔",
+            description=f"Out of: `{', '.join(choices_list)}`\nI choose: **{chosen}**",
+            color=discord.Color.dark_grey(), # Neutral color
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.set_footer(text=self.create_utility_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    @commands.command(aliases=['server', 'guildinfo'])
+    async def serverinfo(self, ctx):
+        """Displays detailed information about the current server."""
+        guild = ctx.guild
+        
+        total_members = guild.member_count
+        humans = len([m for m in guild.members if not m.bot])
+        bots = total_members - humans
+        
+        text_channels = len(guild.text_channels)
+        voice_channels = len(guild.voice_channels)
+        categories = len(guild.categories)
+        
+        embed = discord.Embed(
+            title="📊 Server Information",
+            color=discord.Color.dark_blue(), # A darker, more "info" type blue
+            timestamp=guild.created_at # Show server creation date as timestamp
+        )
+        if guild.icon:
+            embed.set_thumbnail(url=guild.icon.url)
+            
+        embed.add_field(name="📜 Name", value=guild.name, inline=True)
+        embed.add_field(name="🆔 ID", value=guild.id, inline=True)
+        if guild.owner: # Owner might be None in some edge cases
+            embed.add_field(name="👑 Owner", value=guild.owner.mention, inline=True)
+        
+        embed.add_field(name="👥 Members", value=f"Total: {total_members}\nHumans: {humans}\nBots: {bots}", inline=True)
+        embed.add_field(name="💬 Channels", value=f"Text: {text_channels}\nVoice: {voice_channels}\nCategories: {categories}", inline=True)
+        embed.add_field(name="🎭 Roles", value=str(len(guild.roles)), inline=True)
+        
+        # Optional: Add more fields like verification level, boost status, etc.
+        # embed.add_field(name="✅ Verification Level", value=str(guild.verification_level).capitalize(), inline=True)
+        # if guild.features:
+        #    embed.add_field(name="✨ Features", value=", ".join(guild.features[:5]) + ("..." if len(guild.features) > 5 else ""), inline=False) # Show first 5
+
+        embed.set_footer(text=f"Requested by {ctx.author.display_name} | Server Created", icon_url=ctx.author.avatar.url if ctx.author.avatar else None) # Footer indicates timestamp is creation date
+        await ctx.send(embed=embed)
+
+    @commands.command(aliases=['whois', 'memberinfo'])
+    async def userinfo(self, ctx, *, member: discord.Member = None):
+        """Displays detailed information about a user."""
+        if member is None:
+            member = ctx.author
+
+        embed = discord.Embed(
+            title=f"👤 User Information for {member.display_name}",
+            color=discord.Color.teal(),
+            timestamp=datetime.datetime.utcnow() # Shows when the command was run
+        )
+        if member.avatar:
+            embed.set_thumbnail(url=member.avatar.url)
+
+        embed.add_field(name="📛 Name", value=f"{member.name}#{member.discriminator}", inline=True)
+        embed.add_field(name="🆔 ID", value=member.id, inline=True)
+        if member.nick:
+            embed.add_field(name="Nickname", value=member.nick, inline=True)
+        
+        status_emoji_map = {
+            discord.Status.online: "🟢 Online",
+            discord.Status.idle: "🟡 Idle",
+            discord.Status.dnd: "🔴 Do Not Disturb",
+            discord.Status.offline: "⚫ Offline",
+            discord.Status.invisible: "⚪ Invisible (likely offline)"
+        }
+        embed.add_field(name="<:status_online:12345> Status", value=status_emoji_map.get(member.status, str(member.status).capitalize()), inline=True) # Placeholder emoji
+
+        if member.activity:
+            activity_type = member.activity.type
+            activity_name = member.activity.name
+            activity_details = ""
+            if activity_type == discord.ActivityType.playing: activity_details = f"Playing **{activity_name}**"
+            elif activity_type == discord.ActivityType.streaming: activity_details = f"Streaming **{activity_name}** on {member.activity.platform}"
+            elif activity_type == discord.ActivityType.listening: activity_details = f"Listening to **{activity_name}**"
+            elif activity_type == discord.ActivityType.watching: activity_details = f"Watching **{activity_name}**"
+            elif activity_type == discord.ActivityType.custom: activity_details = f"Custom Status: {member.activity.emoji if member.activity.emoji else ''} **{activity_name}**"
+            else: activity_details = f"{str(activity_type).split('.')[-1].capitalize()} **{activity_name}**"
+            if activity_details:
+                 embed.add_field(name="🎮 Activity", value=activity_details, inline=False)
+
+
+        # Roles (show top 5 roles excluding @everyone)
+        roles = [role.mention for role in sorted(member.roles, key=lambda r: r.position, reverse=True) if role.name != "@everyone"]
+        if roles:
+            role_str = ", ".join(roles[:5])
+            if len(roles) > 5:
+                role_str += f" (+{len(roles) - 5} more)"
+            embed.add_field(name=f"🎭 Roles [{len(roles)}]", value=role_str, inline=False)
+        
+        embed.add_field(name="📅 Account Created", value=discord.utils.format_dt(member.created_at, style='F'), inline=True)
+        embed.add_field(name="📥 Joined Server", value=discord.utils.format_dt(member.joined_at, style='F'), inline=True)
+        
+        embed.set_footer(text=self.create_utility_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    @commands.command(aliases=['av', 'pfp'])
+    async def avatar(self, ctx, *, member: discord.Member = None):
+        """Displays a user's avatar."""
+        if member is None:
+            member = ctx.author
+
+        embed = discord.Embed(
+            title=f"🖼️ Avatar for {member.display_name}",
+            color=discord.Color.blurple(), # A nice Discord-y color
+            timestamp=datetime.datetime.utcnow()
+        )
+        if member.avatar:
+            embed.set_image(url=member.avatar.url)
+            embed.description = f"[Link to Avatar]({member.avatar.url})" # Add a direct link as well
+        else:
+            embed.description = "This user has the default Discord avatar."
+            # Optionally, set a default image or leave it without one
+            # embed.set_image(url="URL_TO_DEFAULT_AVATAR_IMAGE") 
+
+        embed.set_footer(text=self.create_utility_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+# --- FunCommands Cog ---
+class FunCommands(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        # Predefined lists for commands like pat, hug, etc. if using static URLs
+        self.pat_gifs = [
+            "https://c.tenor.com/D1bUYir22R0AAAAC/pat-anime.gif",
+            "https://c.tenor.com/G1isV4J6d20AAAAC/head-pat-anime.gif",
+            "https://c.tenor.com/N41zKED2wK0AAAAC/anime-head-pat-anime.gif"
+        ]
+        self.hug_gifs = [
+            "https://c.tenor.com/2lr9uM5Jm2gAAAAC/hug-anime-hug.gif",
+            "https://c.tenor.com/82c8M0kM4F0AAAAC/anime-hug.gif",
+            "https://c.tenor.com/qF7mO4nnL0gAAAAC/hug-anime.gif"
+        ]
+        self.slap_gifs = [
+            "https://c.tenor.com/rselR4e7jD4AAAAC/slap-anime.gif",
+            "https://c.tenor.com/UDo0K2B6tqsAAAAC/anime-slap-mad.gif",
+            "https://c.tenor.com/1-1L1rCCS0AAAAAC/slap.gif"
+        ]
+        self.kiss_gifs = [
+            "https://c.tenor.com/dn_KuOESmUYAAAAC/anime-kiss.gif",
+            "https://c.tenor.com/3wE3JUmvjFMAAAAC/anime-kissing.gif",
+            "https://c.tenor.com/s_122jW222gAAAAC/anime-kiss.gif"
+        ]
+        self.jokes = [
+            "Why don't scientists trust atoms? Because they make up everything!",
+            "Why did the scarecrow win an award? Because he was outstanding in his field!",
+            "Why don't skeletons fight each other? They don't have the guts.",
+            "What do you call fake spaghetti? An impasta!",
+            "Why was the math book sad? Because it had too many problems."
+        ]
+        self.facts = [
+            "A single cloud can weigh more than 1 million pounds.",
+            "A shrimp's heart is in its head.",
+            "It is physically impossible for pigs to look up into the sky.",
+            "The national animal of Scotland is the unicorn.",
+            "A crocodile cannot stick its tongue out."
+        ]
+
+    # Helper for footer
+    def create_fun_footer(self, ctx):
+        return f"Requested by {ctx.author.display_name}" # Simpler footer for fun commands
+
+    # Generic error handler for FunCommands
+    async def cog_command_error(self, ctx, error):
+        title = "🤪 Whoopsie! 🤪"
+        description = "Something went a bit silly."
+        color = discord.Color.random() # Keep it fun!
+
+        if isinstance(error, commands.MissingRequiredArgument):
+            title = "🤔 Missing Something?"; description = f"I need `{error.param.name}` to work my magic!"
+        elif isinstance(error, commands.BadArgument):
+            title = "😵 Argument Achoo!"; description = f"That argument doesn't look right. {error}"
+        elif isinstance(error, commands.MemberNotFound):
+            title = "👻 Member Not Found"; description = f"I couldn't find the member: `{error.argument}`. Are they hiding?"
+        elif isinstance(error, commands.UserNotFound):
+            title = "🕵️ User Not Found"; description = f"Hmm, user `{error.argument}` seems to be off on an adventure."
+        else:
+            description = f"An unexpected oopsie happened: {error}"
+            print(f"Unhandled error in FunCommands cog: {error.__class__.__name__} - {error}")
+
+        embed = discord.Embed(title=title, description=description, color=color, timestamp=datetime.datetime.utcnow())
+        embed.set_footer(text="Try again, maybe with more glitter?")
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    async def howgay(self, ctx, member: discord.Member = None):
+        """Calculates how gay a user is."""
+        if member is None:
+            member = ctx.author
+        
+        gay_percentage = random.randint(0, 100)
+        
+        embed = discord.Embed(
+            title="🏳️‍🌈 Gay Rate Machine 🏳️‍🌈",
+            description=f"{member.mention} is **{gay_percentage}%** gay!",
+            color=discord.Color.magenta(), # Or discord.Color.random() if preferred
+            timestamp=datetime.datetime.utcnow()
+        )
+        if member.avatar:
+            embed.set_thumbnail(url=member.avatar.url)
+        embed.set_footer(text=self.create_fun_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    async def meme(self, ctx):
+        """Shows a random meme."""
+        # Placeholder: In a real bot, this would fetch from Reddit API, Giphy, etc.
+        # Using one of the slap_gifs as a placeholder "meme" for now.
+        meme_url = random.choice(self.slap_gifs) # Re-using a list for example
+        source_text = "Placeholder Source (e.g., Tenor)"
+
+        embed = discord.Embed(
+            title="🤣 Fresh Meme! 🤣",
+            color=discord.Color.random(seed=meme_url), # Seed random for consistent color for same meme url
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.set_image(url=meme_url)
+        embed.set_footer(text=f"{self.create_fun_footer(ctx)} | Source: {source_text}", icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    async def mock(self, ctx, *, text: str):
+        """Converts text to MoCkInG CaSe."""
+        mocked_text = "".join([char.upper() if i % 2 == 0 else char.lower() for i, char in enumerate(text)])
+        embed = discord.Embed(
+            title="🥴 MoCkInG TeXt 🥴",
+            description=mocked_text,
+            color=discord.Color.yellow(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.set_footer(text=self.create_fun_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    async def clap(self, ctx, *, text: str):
+        """Adds claps between words."""
+        clapped_text = "👏 " + " 👏 ".join(text.split()) + " 👏"
+        embed = discord.Embed(
+            title="👏 Text Clapper 👏",
+            description=clapped_text,
+            color=discord.Color.orange(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.set_footer(text=self.create_fun_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    async def reverse(self, ctx, *, text: str):
+        """Reverses the given text."""
+        reversed_text = text[::-1]
+        embed = discord.Embed(
+            title="🔄 Text Reverser 🔄",
+            description=f"**Original:** {text}\n**Reversed:** {reversed_text}",
+            color=discord.Color.blurple(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.set_footer(text=self.create_fun_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    @commands.command(aliases=['toss'])
+    async def flip(self, ctx):
+        """Flips a coin."""
+        result = random.choice(['Heads', 'Tails'])
+        embed = discord.Embed(
+            title="🪙 Coin Flip 🪙",
+            description=f"The coin landed on: **{result}**!",
+            color=discord.Color.dark_gold(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        # Optional: Set thumbnail based on result
+        # if result == "Heads": embed.set_thumbnail(url="URL_TO_HEADS_IMAGE")
+        # else: embed.set_thumbnail(url="URL_TO_TAILS_IMAGE")
+        embed.set_footer(text=self.create_fun_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    @commands.command(aliases=['rockpaperscissors'])
+    async def rps(self, ctx, choice: str):
+        """Play Rock, Paper, Scissors with the bot!"""
+        valid_choices = ['rock', 'paper', 'scissors']
+        player_choice = choice.lower()
+
+        if player_choice not in valid_choices:
+            embed = discord.Embed(title="🗿📄✂️ RPS Error ✂️📄🗿", description=f"That's not a valid choice! Try `rock`, `paper`, or `scissors`.", color=discord.Color.red())
+            await ctx.send(embed=embed)
+            return
+
+        bot_choice = random.choice(valid_choices)
+        
+        result_text = ""
+        result_color = discord.Color.default()
+
+        if player_choice == bot_choice:
+            result_text = f"It's a **Tie**! We both chose **{player_choice}**."
+            result_color = discord.Color.light_grey()
+        elif (player_choice == 'rock' and bot_choice == 'scissors') or \
+             (player_choice == 'paper' and bot_choice == 'rock') or \
+             (player_choice == 'scissors' and bot_choice == 'paper'):
+            result_text = f"🎉 You **Win**! Your **{player_choice}** beats my **{bot_choice}**."
+            result_color = discord.Color.green()
+        else:
+            result_text = f"😢 You **Lose**! My **{bot_choice}** beats your **{player_choice}**."
+            result_color = discord.Color.red()
+
+        embed = discord.Embed(
+            title="🗿📄✂️ Rock Paper Scissors ✂️📄🗿",
+            description=result_text,
+            color=result_color,
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.add_field(name="Your Choice", value=player_choice.capitalize(), inline=True)
+        embed.add_field(name="My Choice", value=bot_choice.capitalize(), inline=True)
+        embed.set_footer(text=self.create_fun_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    @commands.command(aliases=['uwu', 'uwuify'])
+    async def owo(self, ctx, *, text: str):
+        """OwO-ifies your text!"""
+        replacements = {
+            'r': 'w', 'l': 'w', 'R': 'W', 'L': 'W',
+            'no': 'nu', 'No': 'Nu', 'NO': 'NU',
+            'ove': 'uv', 'Ove': 'Uv', 'OVE': 'UV',
+            'th': 'd', 'Th': 'D', 'TH': 'D',
+            'n': 'ny', 'N': 'Ny' # Simple n to ny, can be more nuanced
+        }
+        # Add some cute faces/suffixes randomly
+        suffixes = [" OwO", " UwU", " >w<", " ^_^", " owo", " uwu", " nya~", " mrrp~"]
+        
+        owo_text = text
+        for old, new in replacements.items():
+            owo_text = owo_text.replace(old, new)
+        
+        if random.random() < 0.7: # 70% chance to add a suffix
+             owo_text += random.choice(suffixes)
+
+
+        hotpink_color = getattr(discord.Color, 'hotpink', discord.Color.magenta)
+        embed = discord.Embed(
+            title="🌸 OwO What's This? 🌸",
+            description=owo_text,
+            color=hotpink_color(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.set_footer(text=self.create_fun_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+        
+    @commands.command(aliases=['pp', 'dicksize'])
+    async def ppsize(self, ctx, member: discord.Member = None):
+        """Totally accurate PP size measurement."""
+        if member is None:
+            member = ctx.author
+            
+        size = "8" + random.choice(['='*i for i in range(1, 15)]) + "D"
+        
+        embed = discord.Embed(
+            title="📏 PP Size Detector 📏",
+            description=f"{member.mention}'s PP size is: **{size}**",
+            color=discord.Color.random(seed=member.id), # Consistent random color per user
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.set_footer(text=self.create_fun_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    async def _send_interaction_embed(self, ctx, member: discord.Member, title: str, description_template: str, gifs: list, color: discord.Color):
+        """Helper for pat, hug, slap, kiss commands."""
+        if member == ctx.author:
+            description = f"Aww, {ctx.author.mention} needs some self-love! Here's a virtual one for you! 🤗"
+            if "pats" in description_template:
+                description = f"{ctx.author.mention} pats themselves gently. Self-care is important! 😊"
+            elif "slaps" in description_template: # Slapping self might be too negative
+                description = f"{ctx.author.mention} looks like they need a hug, not a slap! 🤗"
+            elif "kisses" in description_template:
+                 description = f"{ctx.author.mention} gives themselves a loving kiss! 😘"
+
+        elif member == self.bot.user:
+            description = f"Aww, thank you {ctx.author.mention}! That's so sweet of you! 🥰"
+            if "slaps" in description_template:
+                description = f"Ouch! {ctx.author.mention}, why would you slap me? 😢"
+        else:
+            description = description_template.format(author=ctx.author.mention, member=member.mention)
+
+        embed = discord.Embed(
+            title=title,
+            description=description,
+            color=color,
+            timestamp=datetime.datetime.utcnow()
+        )
+        if gifs: # Check if the list is not empty
+            embed.set_image(url=random.choice(gifs))
+        embed.set_footer(text=self.create_fun_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
+
+    @commands.command()
+    async def pat(self, ctx, member: discord.Member):
+        """Pats a member gently."""
+        await self._send_interaction_embed(ctx, member, "🥰 A Gentle Pat 🥰", "{author} pats {member}!", self.pat_gifs, discord.Color.gold())
+
+    @commands.command()
+    async def hug(self, ctx, member: discord.Member):
+        """Hugs a member warmly."""
+        await self._send_interaction_embed(ctx, member, "🫂 A Warm Hug 🫂", "{author} hugs {member} tightly!", self.hug_gifs, discord.Color.purple())
+
+    @commands.command()
+    async def slap(self, ctx, member: discord.Member):
+        """Slaps a member! Ouch!"""
+        await self._send_interaction_embed(ctx, member, "💥 Ouch! A Slap! 💥", "{author} slaps {member}!", self.slap_gifs, discord.Color.red())
     
-    response = requests.get(f'https://www.reddit.com/r/{category}/random/.json', headers={'User-agent': 'Mozilla/5.0'})
-    json_data = response.json()
-    post = json_data[0]['data']['children'][0]['data']
-    
-    permalink = post['permalink']
-    meme_url = f"https://reddit.com{permalink}"
-    meme_image = post['url']
-    meme_title = post['title']
-    meme_upvotes = post['ups']
-    meme_num_comments = post['num_comments']
-    
-    embed = discord.Embed(title=meme_title, url=meme_url, color=discord.Color.random())
-    embed.set_image(url=meme_image)
-    embed.set_footer(text=f"👍 {meme_upvotes} 💬 {meme_num_comments}")
-    
-    await ctx.send(embed=embed)
+    @commands.command()
+    async def kiss(self, ctx, member: discord.Member):
+        """Gives a member a sweet kiss."""
+        hotpink_color = getattr(discord.Color, 'hotpink', discord.Color.magenta) # Fallback if hotpink not defined
+        await self._send_interaction_embed(ctx, member, "😘 Smooch! 😘", "{author} gives {member} a sweet kiss!", self.kiss_gifs, hotpink_color())
 
-   
-@bot.command(name="cat")
-async def cat(ctx: commands.Context) -> None:
-    response = requests.get('https://api.thecatapi.com/v1/images/search')
-    url = response.json()[0]["url"]
-    embed = discord.Embed()
-    embed.set_image(url=url)
-    await ctx.send(embed=embed)
+    @commands.command(aliases=['respects'])
+    async def f(self, ctx, *, thing: str = "everything"):
+        """Pays respects."""
+        embed = discord.Embed(
+            title="💔 Paying Respects 💔",
+            description=f"{ctx.author.mention} has paid their respects for **{thing}**.",
+            color=discord.Color.light_grey(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.set_footer(text=self.create_fun_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
 
+    @commands.command()
+    async def rate(self, ctx, *, item: str):
+        """Rates something out of 10."""
+        rating = random.randint(0, 10)
+        embed = discord.Embed(
+            title="⭐ Rate Machine ⭐",
+            description=f"I'd rate **{item}** a **{rating}/10**!",
+            color=discord.Color.gold(), # Or random
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.set_footer(text=self.create_fun_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
 
-@bot.command(name="dog")
-async def dog(ctx: commands.Context) -> None:
-    response = requests.get('https://dog.ceo/api/breeds/image/random')
-    url = response.json()["message"]
-    embed = discord.Embed()
-    embed.set_image(url=url)
-    await ctx.send(embed=embed)
+    @commands.command()
+    async def fact(self, ctx):
+        """Tells a random interesting fact."""
+        if not self.facts: # Should not happen with predefined list
+            await ctx.send(embed=discord.Embed(title="🧠 Oops!", description="I'm out of facts right now!", color=discord.Color.red())); return
+        
+        embed = discord.Embed(
+            title="🧠 Did You Know? 🧠",
+            description=random.choice(self.facts),
+            color=discord.Color.blue(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.set_footer(text=self.create_fun_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
 
+    @commands.command()
+    async def joke(self, ctx):
+        """Tells a random joke."""
+        if not self.jokes: # Should not happen
+            await ctx.send(embed=discord.Embed(title="😂 Oops!", description="I seem to have forgotten all my jokes!", color=discord.Color.red())); return
 
-@bot.command(name="joke")
-async def joke(ctx: commands.Context) -> None:
-    response = requests.get('https://official-joke-api.appspot.com/random_joke')
-    joke = response.json()
-    await ctx.send(f"{joke['setup']} {joke['punchline']}")
+        embed = discord.Embed(
+            title="😂 Joke Time! 😂",
+            description=random.choice(self.jokes),
+            color=discord.Color.teal(),
+            timestamp=datetime.datetime.utcnow()
+        )
+        embed.set_footer(text=self.create_fun_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
 
+    @commands.command()
+    async def ship(self, ctx, member1: discord.Member, member2: discord.Member = None):
+        """Calculates the love compatibility between two users."""
+        if member2 is None: # If only one member is provided, ship with author
+            member2 = member1
+            member1 = ctx.author
+            
+        if member1 == member2:
+            description = f"❤️ Self-love is important! {member1.mention} is **100%** compatible with themselves! ❤️"
+            ship_percentage = 100 # Or a fun message
+        else:
+            ship_percentage = random.randint(0, 100)
+            description = f"Love between {member1.mention} and {member2.mention} is **{ship_percentage}%**!"
 
-@bot.command(name="quote")
-async def quote(ctx: commands.Context) -> None:
-    response = requests.get('https://zenquotes.io/api/random')
-    quote = response.json()[0]
-    await ctx.send(f"{quote['q']} - {quote['a']}")
+        embed = discord.Embed(
+            title="💖 Ship Calculator 💖",
+            description=description,
+            color=discord.Color.pink() if 'pink' in dir(discord.Color) else discord.Color.magenta(), # .pink() might not exist, use magenta as fallback
+            timestamp=datetime.datetime.utcnow()
+        )
+        # Optional: Could try to combine avatars or use a heart image
+        # For now, keeping it simple.
+        embed.set_footer(text=self.create_fun_footer(ctx), icon_url=ctx.author.avatar.url if ctx.author.avatar else None)
+        await ctx.send(embed=embed)
 
+async def main():
+    async with bot:
+        await bot.add_cog(Music(bot))
+        await bot.add_cog(Moderation(bot)) 
+        await bot.add_cog(FunCommands(bot)) # Add the FunCommands cog
+        await bot.add_cog(UtilityCommands(bot)) # Add the UtilityCommands cog
+        await bot.start("hidden")
 
-@bot.command(name='fact')
-async def get_fact(ctx, category: str = 'random'):
-    # Set up the API URL based on the category parameter
-    if category == 'random':
-        url = 'https://uselessfacts.jsph.pl/random.json?language=en'
-    elif category == 'cat':
-        url = 'https://uselessfacts.jsph.pl/cat.json?language=en'
-    elif category == 'dog':
-        url = 'https://uselessfacts.jsph.pl/dog.json?language=en'
-    elif category == 'minecraft':
-        url = 'https://uselessfacts.jsph.pl/minecraft.json?language=en'
-    elif category == 'roblox':
-        url = 'https://uselessfacts.jsph.pl/roblox.json?language=en'
-    else:
-        await ctx.send('Sorry, that category is not supported.')
-        return
-    
-    # Call the API and get a random fact
-    response = requests.get(url)
-    if response.status_code != 200:
-        await ctx.send('Sorry, something went wrong. Please try again later.')
-        return
-    data = response.json()
-    fact = data['text']
-    
-    # Send the fact as a message
-    message = f'Here is a {category} fact: {fact}'
-    await ctx.send(message)
-
-
-
-@bot.command(name="news")
-async def news(ctx: commands.Context, *, source: str) -> None:
-    url = f"https://newsapi.org/v2/top-headlines?sources={source}&apiKey=YOUR_API_KEY_HERE"
-    response = requests.get(url)
-    articles = response.json()["articles"]
-    for article in articles:
-        await ctx.send(f"{article['title']} - {article['url']}")
-
-
-bot.run('MTA4NTczNjc4ODkyNjE0ODY5OQ.Gs1xg7.JWonLEF_4r7PazznA68QiDhYy_aQmY4-M9_6qc')
+if __name__ == '__main__':
+    asyncio.run(main())
