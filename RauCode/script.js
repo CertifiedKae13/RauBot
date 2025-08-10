@@ -53,7 +53,7 @@ class Projectile {
     }
 
     draw(context) {
-        context.fillStyle = 'white';
+        context.fillStyle = '#ff00ff'; // Magenta laser
         context.fillRect(this.x, this.y, this.width, this.height);
     }
 }
@@ -99,8 +99,13 @@ class Player {
     }
 
     draw(context) {
-        context.fillStyle = 'green'; // Placeholder color
-        context.fillRect(this.x, this.y, this.width, this.height);
+        context.fillStyle = '#00ff00'; // Bright green
+        context.beginPath();
+        context.moveTo(this.x + this.width / 2, this.y);
+        context.lineTo(this.x, this.y + this.height);
+        context.lineTo(this.x + this.width, this.y + this.height);
+        context.closePath();
+        context.fill();
 
         // Draw projectiles
         this.projectiles.forEach(p => p.draw(context));
@@ -131,20 +136,72 @@ class Enemy {
     }
 
     draw(context) {
-        context.fillStyle = 'red'; // Placeholder color
-        context.fillRect(this.x, this.y, this.width, this.height);
+        context.fillStyle = '#ff4d4d'; // Bright red
+        // A simple "crab" like shape
+        const segment = this.width / 4;
+        context.fillRect(this.x + segment, this.y, segment * 2, this.height); // Body
+        context.fillRect(this.x, this.y + this.height / 2, this.width, this.height / 2); // "Legs" part
     }
 
-    // Update method for enemy movement will be added later
+    // This will be empty as the EnemyGrid now controls movement
+    update() {}
+}
+
+// --- Enemy Grid Class ---
+class EnemyGrid {
+    constructor() {
+        this.enemies = [];
+        this.speed = 1; // Speed of the grid's horizontal movement
+        this.direction = 1; // 1 for right, -1 for left
+
+        const columns = 5;
+        const rows = 3;
+        const enemyPadding = 20;
+        const startX = 50;
+        const startY = 50;
+
+        for (let r = 0; r < rows; r++) {
+            for (let c = 0; c < columns; c++) {
+                const enemyX = startX + c * (ENEMY_WIDTH + enemyPadding);
+                const enemyY = startY + r * (ENEMY_HEIGHT + enemyPadding);
+                this.enemies.push(new Enemy(enemyX, enemyY));
+            }
+        }
+    }
+
     update() {
-        // Basic downward movement for now
-        this.y += 0.5;
+        let hitEdge = false;
+        // Check if any enemy in the grid will hit the edge in the next frame
+        for (const enemy of this.enemies) {
+            if ((enemy.x + enemy.width >= canvas.width && this.direction > 0) || (enemy.x <= 0 && this.direction < 0)) {
+                hitEdge = true;
+                break;
+            }
+        }
+
+        if (hitEdge) {
+            this.direction *= -1; // Reverse direction
+            // Move all enemies down
+            this.enemies.forEach(e => {
+                e.y += ENEMY_HEIGHT / 2;
+            });
+        } else {
+            // Move all enemies horizontally
+            this.enemies.forEach(e => {
+                e.x += this.speed * this.direction;
+            });
+        }
+    }
+
+    draw(context) {
+        this.enemies.forEach(enemy => enemy.draw(context));
     }
 }
 
+
 // --- Game State and Initialization ---
 let player;
-let enemies = [];
+let enemyGrid;
 
 function init() {
     // Create the player in the bottom center of the canvas
@@ -152,12 +209,8 @@ function init() {
     const playerY = canvas.height - PLAYER_HEIGHT - 10;
     player = new Player(playerX, playerY);
 
-    // Create a simple row of enemies for now
-    for (let i = 0; i < 5; i++) {
-        const enemyX = 50 + i * (ENEMY_WIDTH + 40);
-        const enemyY = 50;
-        enemies.push(new Enemy(enemyX, enemyY));
-    }
+    // Create the grid of enemies
+    enemyGrid = new EnemyGrid();
 }
 
 // --- Utility Functions ---
@@ -173,10 +226,10 @@ function checkCollision(rect1, rect2) {
 // --- Main Game Loop ---
 function update() {
     player.update();
+    enemyGrid.update();
 
-    enemies.forEach(enemy => {
-        enemy.update();
-        // Check for collisions between player projectiles and this enemy
+    // Collision detection
+    enemyGrid.enemies.forEach(enemy => {
         player.projectiles.forEach(projectile => {
             if (checkCollision(projectile, enemy)) {
                 projectile.markedForDeletion = true;
@@ -185,8 +238,8 @@ function update() {
         });
     });
 
-    // Remove marked enemies
-    enemies = enemies.filter(enemy => !enemy.markedForDeletion);
+    // Remove marked enemies from the grid
+    enemyGrid.enemies = enemyGrid.enemies.filter(enemy => !enemy.markedForDeletion);
 }
 
 function draw() {
@@ -199,7 +252,7 @@ function draw() {
     player.draw(ctx);
 
     // Draw the enemies
-    enemies.forEach(enemy => enemy.draw(ctx));
+    enemyGrid.draw(ctx);
 }
 
 function gameLoop() {
